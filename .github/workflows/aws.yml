@@ -8,7 +8,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # Prevent workflow from running indefinitely
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -30,163 +30,66 @@ jobs:
       - name: Build and Push Docker image to ECR
         run: |
           IMAGE_URI=551140580894.dkr.ecr.us-east-1.amazonaws.com/my_repo:latest
-          echo "🔨 Building Docker image..."
           docker build -t $IMAGE_URI .
-          echo "📤 Pushing image to ECR..."
           docker push $IMAGE_URI
-          echo "✅ Image pushed successfully: $IMAGE_URI"
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
       - name: Update ECS task definition
         id: update-task-def
         run: |
-          IMAGE="551140580894.dkr.ecr.us-east-1.amazonaws.com/my_repo:latest"
-          echo "📋 Fetching current task definition..."
+          IMAGE="${{ env.IMAGE_URI }}"
           
           TASK_DEF=$(aws ecs describe-task-definition \
             --task-definition medusa-task \
             --region us-east-1)
 
-          echo "🔄 Updating task definition with new image..."
           NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
             --arg IMAGE "$IMAGE" \
             '.taskDefinition |
             .containerDefinitions[0].image = $IMAGE |
+            .containerDefinitions[0].environment = [
+              {"name":"NODE_ENV","value":"production"},
+              {"name":"DATABASE_URL","value":"postgres://admin123:admin717@medusa-db.cluster-cmviaqawigqs.us-east-1.rds.amazonaws.com/medusadb"},
+              {"name":"ADMIN_CORS","value":"*"},
+              {"name":"STORE_CORS","value":"*"},
+              {"name":"AUTH_CORS","value":"*"},
+              {"name":"JWT_SECRET","value":"supersecret"},
+              {"name":"COOKIE_SECRET","value":"supersecret"}
+            ] |
             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
 
-          echo "📝 Registering new task definition..."
           NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
             --region us-east-1 \
             --cli-input-json "$NEW_TASK_DEF" \
             | jq -r '.taskDefinition.taskDefinitionArn')
 
-          echo "✅ New task definition registered: $NEW_TASK_DEF_ARN"
           echo "task_definition_arn=$NEW_TASK_DEF_ARN" >> $GITHUB_OUTPUT
 
       - name: Update ECS service
         run: |
-          echo "🚀 Updating ECS service with new task definition..."
           aws ecs update-service \
             --cluster medusa-ecs-cluster \
             --service medusa-service \
             --task-definition ${{ steps.update-task-def.outputs.task_definition_arn }} \
             --force-new-deployment \
             --region us-east-1
-          echo "✅ ECS service update initiated"
 
-      - name: Wait for ECS service to stabilize with enhanced monitoring
+      - name: Wait for ECS service to stabilize
         timeout-minutes: 20
         run: |
-          echo "🔍 Monitoring ECS deployment progress..."
-          
-          # Function to get service status
-          get_service_status() {
-            aws ecs describe-services \
+          for i in {1..40}; do
+            STATUS=$(aws ecs describe-services \
               --cluster medusa-ecs-cluster \
               --services medusa-service \
               --region us-east-1 \
-              --query 'services[0]' \
-              --output json
-          }
-          
-          # Function to get running task count
-          get_task_counts() {
-            get_service_status | jq -r '.runningCount, .desiredCount, .deployments[0].status'
-          }
-          
-          # Function to check for failed tasks and get their details
-          check_failed_tasks() {
-            echo "🔍 Checking for failed tasks..."
-            
-            FAILED_TASKS=$(aws ecs list-tasks \
-              --cluster medusa-ecs-cluster \
-              --service medusa-service \
-              --desired-status STOPPED \
-              --region us-east-1 \
-              --query 'taskArns[0:3]' \
+              --query 'services[0].deployments[0].rolloutState' \
               --output text)
-            
-            if [ "$FAILED_TASKS" != "None" ] && [ -n "$FAILED_TASKS" ]; then
-              echo "⚠️ Found recently failed tasks. Getting details..."
-              
-              for task in $FAILED_TASKS; do
-                if [ "$task" != "None" ]; then
-                  echo "📋 Task: $task"
-                  aws ecs describe-tasks \
-                    --cluster medusa-ecs-cluster \
-                    --tasks "$task" \
-                    --region us-east-1 \
-                    --query 'tasks[0].{StoppedReason:stoppedReason,LastStatus:lastStatus,Containers:containers[0].{Name:name,ExitCode:exitCode,Reason:reason}}' \
-                    --output table
-                fi
-              done
-            fi
-          }
-          
-          # Main monitoring loop
-          for i in {1..40}; do  # Check for 20 minutes (40 × 30 seconds)
-            echo "📊 Deployment check $i/40..."
-            
-            # Get current status
-            read RUNNING_COUNT DESIRED_COUNT DEPLOYMENT_STATUS <<< $(get_task_counts)
-            
-            echo "   Running: $RUNNING_COUNT/$DESIRED_COUNT | Deployment: $DEPLOYMENT_STATUS"
-            
-            # Check if deployment is successful
-            if [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ] && [ "$DEPLOYMENT_STATUS" = "PRIMARY" ]; then
-              echo "🎉 Deployment successful! Service is stable."
-              
-              # Show final service status
-              echo "📋 Final service status:"
-              get_service_status | jq '.serviceName, .status, .deployments[0] | {status, runningCount, desiredCount, createdAt}'
+            echo "⏳ Deployment status: $STATUS"
+            if [ "$STATUS" = "COMPLETED" ]; then
+              echo "✅ Service is stable!"
               exit 0
             fi
-            
-            # Check for issues every 5th attempt
-            if [ $((i % 5)) -eq 0 ]; then
-              check_failed_tasks
-              
-              # Show current service events (last 5)
-              echo "📝 Recent service events:"
-              get_service_status | jq -r '.events[0:5][] | "\(.createdAt) - \(.message)"'
-            fi
-            
             sleep 30
           done
-          
-          # If we get here, deployment failed
-          echo "❌ Deployment failed to stabilize within 20 minutes"
-          echo ""
-          echo "📋 Final service status:"
-          get_service_status | jq '{serviceName, status, runningCount, desiredCount, deployments: .deployments[0:2]}'
-          
-          echo ""
-          echo "📝 Service events (last 10):"
-          get_service_status | jq -r '.events[0:10][] | "\(.createdAt) - \(.message)"'
-          
-          echo ""
-          check_failed_tasks
-          
-          # Try to get logs from CloudWatch if possible
-          echo "📋 Attempting to get recent container logs..."
-          TASK_ARN=$(aws ecs list-tasks \
-            --cluster medusa-ecs-cluster \
-            --service medusa-service \
-            --region us-east-1 \
-            --query 'taskArns[0]' \
-            --output text)
-            
-          if [ "$TASK_ARN" != "None" ] && [ -n "$TASK_ARN" ]; then
-            TASK_ID=$(echo "$TASK_ARN" | cut -d'/' -f3)
-            echo "🔍 Checking logs for task: $TASK_ID"
-            
-            # Try to get recent logs (this might fail if log group doesn't exist)
-            aws logs get-log-events \
-              --log-group-name /ecs/medusa-task \
-              --log-stream-name "ecs/medusa/$TASK_ID" \
-              --region us-east-1 \
-              --start-time $(date -d '10 minutes ago' +%s)000 \
-              --query 'events[-20:].message' \
-              --output text 2>/dev/null || echo "❌ Could not retrieve container logs"
-          fi
-          
+          echo "❌ Deployment did not stabilize in time"
           exit 1
