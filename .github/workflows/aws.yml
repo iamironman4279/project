@@ -1,4 +1,4 @@
-name: Deploy Medusa Store to AWS ECS
+name: 🚀 Deploy Medusa Store to AWS ECS
 
 on:
   push:
@@ -10,38 +10,44 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    env:
+      AWS_REGION: us-east-1
+      CLUSTER_NAME: medusa-ecs-cluster
+      SERVICE_NAME: medusa-service
+      TASK_NAME: medusa-task
+      ECR_IMAGE_URI: 551140580894.dkr.ecr.us-east-1.amazonaws.com/my_repo:latest
+
     steps:
-      - name: Checkout repository
+      - name: 🛎️ Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
+      - name: 🐳 Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Configure AWS credentials
+      - name: 🔐 Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Log in to Amazon ECR
+      - name: 🔑 Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and Push Docker image to ECR
+      - name: 🛠️ Build and Push Docker image to ECR
         run: |
-          IMAGE_URI=551140580894.dkr.ecr.us-east-1.amazonaws.com/my_repo:latest
-          docker build -t $IMAGE_URI .
-          docker push $IMAGE_URI
-          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+          docker build -t $ECR_IMAGE_URI .
+          docker push $ECR_IMAGE_URI
+          echo "IMAGE_URI=$ECR_IMAGE_URI" >> $GITHUB_ENV
 
-      - name: Update ECS task definition
+      - name: 📦 Update ECS task definition
         id: update-task-def
         run: |
-          IMAGE="${{ env.IMAGE_URI }}"
-          
+          IMAGE="$ECR_IMAGE_URI"
+
           TASK_DEF=$(aws ecs describe-task-definition \
-            --task-definition medusa-task \
-            --region us-east-1)
+            --task-definition $TASK_NAME \
+            --region $AWS_REGION)
 
           NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
             --arg IMAGE "$IMAGE" \
@@ -58,38 +64,65 @@ jobs:
             ] |
             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
 
+          echo "$NEW_TASK_DEF" > new-task-def.json
+
           NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --region us-east-1 \
-            --cli-input-json "$NEW_TASK_DEF" \
+            --cli-input-json file://new-task-def.json \
+            --region $AWS_REGION \
             | jq -r '.taskDefinition.taskDefinitionArn')
 
           echo "task_definition_arn=$NEW_TASK_DEF_ARN" >> $GITHUB_OUTPUT
 
-      - name: Update ECS service
+      - name: 🚀 Update ECS service
         run: |
           aws ecs update-service \
-            --cluster medusa-ecs-cluster \
-            --service medusa-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
             --task-definition ${{ steps.update-task-def.outputs.task_definition_arn }} \
             --force-new-deployment \
-            --region us-east-1
+            --region $AWS_REGION
 
-      - name: Wait for ECS service to stabilize
-        timeout-minutes: 20
+      - name: ⏳ Wait for ECS Deployment to Stabilize
         run: |
           for i in {1..40}; do
             STATUS=$(aws ecs describe-services \
-              --cluster medusa-ecs-cluster \
-              --services medusa-service \
-              --region us-east-1 \
+              --cluster $CLUSTER_NAME \
+              --services $SERVICE_NAME \
+              --region $AWS_REGION \
               --query 'services[0].deployments[0].rolloutState' \
               --output text)
-            echo "⏳ Deployment status: $STATUS"
-            if [ "$STATUS" = "COMPLETED" ]; then
-              echo "✅ Service is stable!"
+
+            DESIRED=$(aws ecs describe-services \
+              --cluster $CLUSTER_NAME \
+              --services $SERVICE_NAME \
+              --region $AWS_REGION \
+              --query 'services[0].desiredCount' \
+              --output text)
+
+            RUNNING=$(aws ecs describe-services \
+              --cluster $CLUSTER_NAME \
+              --services $SERVICE_NAME \
+              --region $AWS_REGION \
+              --query 'services[0].runningCount' \
+              --output text)
+
+            echo "⏳ Attempt $i/40 - Status: $STATUS | Running: $RUNNING / Desired: $DESIRED"
+
+            if [[ "$STATUS" == "COMPLETED" && "$RUNNING" -eq "$DESIRED" ]]; then
+              echo "✅ ECS deployment stabilized!"
               exit 0
             fi
-            sleep 30
+
+            sleep 15
           done
-          echo "❌ Deployment did not stabilize in time"
+
+          echo "❌ ECS deployment did not stabilize."
           exit 1
+
+      # Optional: Uncomment if you want to test the API after deployment
+      # - name: 🧪 Test API
+      #   run: |
+      #     curl --fail http://<your-api-domain>/store/products || {
+      #       echo "❌ API not responding"
+      #       exit 1
+      #     }
